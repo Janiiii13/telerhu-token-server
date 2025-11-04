@@ -5,8 +5,8 @@ const cors = require('cors');
 const admin = require('firebase-admin');
 const { RtcTokenBuilder, RtcRole } = require('agora-access-token');
 
-const APP_ID = process.env.APP_ID || '957be99365fe4ee49f52891b99991cbd';
-const APP_CERT = process.env.APP_CERT || 'db9d9e31a5e74f3884f2425ed4b62dda';
+const APP_ID = process.env.APP_ID || '';
+const APP_CERT = process.env.APP_CERT || '';
 
 if (!APP_ID || !APP_CERT) {
   console.error('Missing APP_ID or APP_CERT. Set APP_ID and APP_CERT in environment.');

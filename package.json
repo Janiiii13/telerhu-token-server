@@ -1,23 +1,16 @@
 {
   "name": "agora-token-server",
   "version": "1.0.0",
-  "description": "Agora token server for Telerhu capstone",
   "main": "server.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
-  "engines": {
-    "node": "18.x"
-  },
   "dependencies": {
-    "agora-access-token": "^2.0.4",
+    "express": "^4.19.2",
     "cors": "^2.8.5",
-    "dotenv": "^17.2.3",
-    "express": "^5.1.0",
-    "firebase-admin": "^12.7.0"
+    "dotenv": "^16.4.5",
+    "firebase-admin": "^12.5.0",
+    "agora-access-token": "^2.0.5"
   }
 }
