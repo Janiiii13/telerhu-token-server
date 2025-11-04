@@ -1,4 +1,4 @@
-// server.js (updated)
+// server.js (updated with /check-token and debug-mode non-exit behavior)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -8,14 +8,22 @@ const { RtcTokenBuilder, RtcRole } = require('agora-access-token');
 const APP_ID = process.env.APP_ID || '';
 const APP_CERT = process.env.APP_CERT || '';
 
+// Helper: in production fail fast, otherwise warn so we can debug without process.exit
+function handleMissingEnv(message) {
+  if (process.env.NODE_ENV === 'production') {
+    console.error(message);
+    process.exit(1);
+  } else {
+    console.warn('DEV WARNING:', message);
+  }
+}
+
 if (!APP_ID || !APP_CERT) {
-  console.error('Missing APP_ID or APP_CERT. Set APP_ID and APP_CERT in environment.');
-  process.exit(1);
+  handleMissingEnv('Missing APP_ID or APP_CERT. Set APP_ID and APP_CERT in environment.');
 }
 
 if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-  console.error('FIREBASE_SERVICE_ACCOUNT_JSON missing in env');
-  process.exit(1);
+  handleMissingEnv('FIREBASE_SERVICE_ACCOUNT_JSON missing in env');
 }
 
 let serviceAccount;
@@ -23,13 +31,12 @@ try {
   // parse the full JSON string provided in env var
   serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
 } catch (err) {
-  console.error('Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON. Ensure it is valid JSON string.', err.message);
-  process.exit(1);
+  handleMissingEnv('Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON. Ensure it is valid JSON string. ' + (err && err.message ? err.message : ''));
+  // if in dev, we continue (serviceAccount may be undefined) — initialization below will catch it
 }
 
 if (!process.env.FIREBASE_DATABASE_URL) {
-  console.error('FIREBASE_DATABASE_URL missing in env');
-  process.exit(1);
+  handleMissingEnv('FIREBASE_DATABASE_URL missing in env');
 }
 
 // ------------------ NEW: normalize private_key to valid PEM ------------------
@@ -73,20 +80,26 @@ try {
     throw new Error('Invalid PEM formatted private key after normalization.');
   }
 } catch (err) {
-  console.error('Failed to normalize/validate private_key:', err.message);
-  process.exit(1);
+  // If serviceAccount is missing or normalization fails, let initializeApp handle it,
+  // but still surface a helpful message (and possibly exit in production via handleMissingEnv)
+  handleMissingEnv('Failed to normalize/validate private_key: ' + (err && err.message ? err.message : 'unknown error'));
 }
 // ---------------------------------------------------------------------------
 
 try {
+  // validate serviceAccount one more time before initializeApp
+  if (!serviceAccount || !serviceAccount.private_key) {
+    throw new Error('Service account invalid or missing private_key');
+  }
+
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
     databaseURL: process.env.FIREBASE_DATABASE_URL
   });
   console.log('Firebase Admin initialized.');
 } catch (err) {
-  console.error('Failed to initialize Firebase Admin SDK:', err && err.message ? err.message : err);
-  process.exit(1);
+  // fail in production, warn in dev
+  handleMissingEnv('Failed to initialize Firebase Admin SDK: ' + (err && err.message ? err.message : err));
 }
 
 const db = admin.database();
@@ -103,6 +116,21 @@ app.get('/', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({ ok: true, time: Date.now(), env: process.env.NODE_ENV || 'unknown' });
 });
+
+// ----------------- DEBUG: non-sensitive env presence checker -----------------
+// Place after /health so it's easy to reach during debugging.
+// Returns booleans (presence) only — never prints secret values.
+app.get('/check-token', (req, res) => {
+  const presence = {
+    APP_ID: !!process.env.APP_ID,
+    APP_CERT: !!process.env.APP_CERT,
+    FIREBASE_SERVICE_ACCOUNT_JSON: !!process.env.FIREBASE_SERVICE_ACCOUNT_JSON,
+    FIREBASE_DATABASE_URL: !!process.env.FIREBASE_DATABASE_URL,
+    NODE_ENV: process.env.NODE_ENV || 'unknown'
+  };
+  res.json({ ok: true, envPresence: presence });
+});
+// ---------------------------------------------------------------------------
 
 // Improved verifier with logging of Firebase auth error codes
 async function verifyIdTokenFromHeader(req) {
