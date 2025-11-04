@@ -5,8 +5,8 @@ const cors = require('cors');
 const admin = require('firebase-admin');
 const { RtcTokenBuilder, RtcRole } = require('agora-access-token');
 
-const APP_ID = process.env.APP_ID || '';
-const APP_CERT = process.env.APP_CERT || '';
+const APP_ID = process.env.APP_ID || '957be99365fe4ee49f52891b99991cbd';
+const APP_CERT = process.env.APP_CERT || 'db9d9e31a5e74f3884f2425ed4b62dda';
 
 if (!APP_ID || !APP_CERT) {
   console.error('Missing APP_ID or APP_CERT. Set APP_ID and APP_CERT in environment.');
@@ -31,6 +31,56 @@ if (!process.env.FIREBASE_DATABASE_URL) {
   console.error('FIREBASE_DATABASE_URL missing in env');
   process.exit(1);
 }
+
+// ------------------ NEW: normalize private_key to valid PEM ------------------
+try {
+  if (!serviceAccount || typeof serviceAccount.private_key !== 'string') {
+    throw new Error('private_key missing or not a string in service account JSON');
+  }
+
+  let pk = serviceAccount.private_key;
+
+  // 1) if the string contains double-escaped backslash-n (\\n) turn them into \n first
+  //    this handles cases where dotenv or other tooling double-escaped.
+  pk = pk.replace(/\\\\n/g, '\\n');
+
+  // 2) convert any escaped \n into real newlines
+  pk = pk.replace(/\\n/g, '\n');
+
+  // 3) defensive trim and remove surrounding quotes (if any)
+  pk = pk.trim().replace(/^"+|"+$/g, '');
+
+  // 4) ensure header/footer exist (add if missing)
+  if (!pk.startsWith('-----BEGIN PRIVATE KEY-----')) {
+    pk = '-----BEGIN PRIVATE KEY-----\n' + pk;
+  }
+  if (!pk.trim().endsWith('-----END PRIVATE KEY-----')) {
+    pk = pk + '\n-----END PRIVATE KEY-----';
+  }
+
+  // 5) ensure it ends with a newline
+  pk = pk.trim() + '\n';
+
+  // assign back
+  serviceAccount.private_key = pk;
+
+  // quick sanity checks (do NOT print the key itself)
+  const okHeader = serviceAccount.private_key.startsWith('-----BEGIN PRIVATE KEY-----');
+  const okFooter = serviceAccount.private_key.trim().endsWith('-----END PRIVATE KEY-----');
+  if (!okHeader || !okFooter) {
+    console.error('Private key header/footer check failed after normalization.');
+    console.error('private_key length:', serviceAccount.private_key.length);
+    throw new Error('Invalid PEM formatted private key after normalization.');
+  }
+  // optional debug: print head/tail and length (safe)
+  console.log('private_key head:', serviceAccount.private_key.slice(0, 30));
+  console.log('private_key tail:', serviceAccount.private_key.slice(-30));
+  console.log('private_key length:', serviceAccount.private_key.length);
+} catch (err) {
+  console.error('Failed to normalize/validate private_key:', err.message);
+  process.exit(1);
+}
+// ---------------------------------------------------------------------------
 
 try {
   admin.initializeApp({
