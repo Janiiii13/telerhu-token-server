@@ -72,10 +72,6 @@ try {
     console.error('private_key length:', serviceAccount.private_key.length);
     throw new Error('Invalid PEM formatted private key after normalization.');
   }
-  // optional debug: print head/tail and length (safe)
-  console.log('private_key head:', serviceAccount.private_key.slice(0, 30));
-  console.log('private_key tail:', serviceAccount.private_key.slice(-30));
-  console.log('private_key length:', serviceAccount.private_key.length);
 } catch (err) {
   console.error('Failed to normalize/validate private_key:', err.message);
   process.exit(1);
@@ -98,6 +94,15 @@ const db = admin.database();
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// simple root and health endpoints
+app.get('/', (req, res) => {
+  res.send('✅ Server running. Use /call/initiate, /call/accept, /call/reject endpoints.');
+});
+
+app.get('/health', (req, res) => {
+  res.json({ ok: true, time: Date.now(), env: process.env.NODE_ENV || 'unknown' });
+});
 
 // Improved verifier with logging of Firebase auth error codes
 async function verifyIdTokenFromHeader(req) {
