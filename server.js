@@ -1,4 +1,4 @@
-// server.js (updated with /check-token and debug-mode non-exit behavior)
+// server.js (updated with /check-token, guarded dev bypass route, and debug-mode non-exit behavior)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -131,6 +131,59 @@ app.get('/check-token', (req, res) => {
   res.json({ ok: true, envPresence: presence });
 });
 // ---------------------------------------------------------------------------
+
+// DEV-ONLY guarded route: use a secret header to allow creating a test call.
+// Set DEV_BYPASS_KEY in Render environment to a random secret (e.g. "dev-xyz-123")
+// This route will only run if DEV_BYPASS_KEY exists and the header x-dev-bypass matches it.
+if (process.env.DEV_BYPASS_KEY) {
+  app.post('/dev/test-initiate', async (req, res) => {
+    try {
+      const bypassHeader = req.headers['x-dev-bypass'];
+      if (!bypassHeader || bypassHeader !== process.env.DEV_BYPASS_KEY) {
+        return res.status(403).json({ error: 'forbidden' });
+      }
+
+      const { doctorUid = 'test-doctor', fakeCallerUid = 'dev-caller-1' } = req.body || {};
+
+      // optional: ensure doctor exists
+      const userSnap = await db.ref(`users/${doctorUid}`).once('value');
+      const userData = userSnap.val();
+      if (!userData) {
+        await db.ref(`users/${doctorUid}`).set({ role: 'doctor', createdAt: admin.database.ServerValue.TIMESTAMP });
+      }
+
+      const channel = `dev-room-${Date.now()}-${Math.floor(Math.random()*1000)}`;
+      const roomRef = db.ref('calls').push();
+      const roomId = roomRef.key;
+
+      const callObj = {
+        channel,
+        callerUid: fakeCallerUid,
+        doctorUid,
+        status: 'ringing',
+        createdAt: admin.database.ServerValue.TIMESTAMP,
+      };
+
+      await roomRef.set(callObj);
+      await db.ref(`users/${doctorUid}/incomingCalls/${roomId}`).set({
+        roomId,
+        channel,
+        callerUid: fakeCallerUid,
+        createdAt: admin.database.ServerValue.TIMESTAMP
+      });
+
+      const callerToken = buildAgoraToken(channel, 0, RtcRole.PUBLISHER);
+      await db.ref(`calls/${roomId}/callerToken`).set(callerToken);
+
+      return res.json({ roomId, channel, token: callerToken });
+    } catch (err) {
+      console.error('/dev/test-initiate error:', err);
+      return res.status(500).json({ error: err.message || 'dev test failed' });
+    }
+  });
+} else {
+  console.warn('DEV_BYPASS_KEY not set; guarded dev bypass route disabled.');
+}
 
 // Improved verifier with logging of Firebase auth error codes
 async function verifyIdTokenFromHeader(req) {
