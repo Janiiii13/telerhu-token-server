@@ -1,4 +1,4 @@
-// server.js (updated with /check-token, guarded dev bypass route, and debug-mode non-exit behavior)
+// server.js (edited for clearer token verification and helpful debug responses)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -185,15 +185,26 @@ if (process.env.DEV_BYPASS_KEY) {
   console.warn('DEV_BYPASS_KEY not set; guarded dev bypass route disabled.');
 }
 
-// Improved verifier with logging of Firebase auth error codes
+// Robust token verifier with clearer error codes and log messages.
+// Returns decoded token on success or throws an Error with .code for callers.
 async function verifyIdTokenFromHeader(req) {
   const authHeader = req.headers.authorization || '';
-  const idToken = authHeader.startsWith('Bearer ') ? authHeader.split('Bearer ')[1] : null;
+  // Accept "Bearer <token>" (case-insensitive for 'bearer' prefix)
+  const parts = authHeader.split(' ');
+  let idToken = null;
+  if (parts.length === 2 && /^Bearer$/i.test(parts[0])) {
+    idToken = parts[1];
+  } else if (authHeader && authHeader.length > 0) {
+    // fallback: if header present but not in Bearer form, attempt to use it as token
+    idToken = authHeader;
+  }
+
   if (!idToken) {
-    const e = new Error('Missing ID token');
+    const e = new Error('Missing ID token in Authorization header. Expected: "Authorization: Bearer <token>"');
     e.code = 'NO_ID_TOKEN';
     throw e;
   }
+
   try {
     const decoded = await admin.auth().verifyIdToken(idToken);
     console.log('verifyIdToken OK uid=', decoded.uid);
@@ -201,6 +212,7 @@ async function verifyIdTokenFromHeader(req) {
   } catch (err) {
     // log error code and message for debugging (e.g. expired, revoked, admin-restricted)
     console.error('verifyIdToken failed. code=', err.code, 'message=', err.message);
+    // rethrow original error so callers can choose status handling
     throw err;
   }
 }
@@ -259,8 +271,12 @@ app.post('/call/initiate', async (req, res) => {
 
 app.post('/call/accept', async (req, res) => {
   try {
+    // Verify token and treat decoded.uid as authoritative caller identity
     const decoded = await verifyIdTokenFromHeader(req);
-    const doctorUid = decoded.uid;
+    const tokenUid = decoded.uid;
+
+    // Also accept optional client-sent doctorUid for debugging, but tokenUid is authoritative
+    const clientDoctorUid = (req.body && req.body.doctorUid) ? req.body.doctorUid : null;
     const { roomId } = req.body;
     if (!roomId) return res.status(400).json({ error: 'roomId required' });
 
@@ -268,11 +284,35 @@ app.post('/call/accept', async (req, res) => {
     const snap = await callRef.once('value');
     const call = snap.val();
     if (!call) return res.status(404).json({ error: 'call not found' });
-    if (call.doctorUid !== doctorUid) return res.status(403).json({ error: 'not the invited doctor' });
 
+    const storedDoctorUid = call.doctorUid || call.doctor || null;
+
+    // Compare tokenUid (authoritative) to stored value
+    if (!storedDoctorUid || tokenUid !== storedDoctorUid) {
+      // In development, include debug fields to help diagnose the mismatch
+      const debugInfo = {
+        error: 'not the invited doctor',
+        reason: 'caller mismatch',
+        tokenUid,
+        clientDoctorUid,
+        storedDoctorUid
+      };
+      console.warn('/call/accept caller mismatch:', debugInfo);
+
+      if (process.env.NODE_ENV === 'production') {
+        // Keep response minimal in production
+        return res.status(403).json({ error: 'not the invited doctor' });
+      } else {
+        // Dev: return helpful debug response
+        return res.status(403).json(debugInfo);
+      }
+    }
+
+    // Update status & create doctor token
     await callRef.update({ status: 'accepted', doctorResponseAt: admin.database.ServerValue.TIMESTAMP });
 
-    await db.ref(`users/${doctorUid}/incomingCalls/${roomId}`).remove();
+    // Remove incoming call entry for doctor
+    await db.ref(`users/${doctorUid}/incomingCalls/${roomId}`).remove().catch(() => {});
 
     const doctorToken = buildAgoraToken(call.channel, 0, RtcRole.PUBLISHER);
     await callRef.child('doctorToken').set(doctorToken);
@@ -284,6 +324,7 @@ app.post('/call/accept', async (req, res) => {
   } catch (err) {
     console.error('/call/accept error:', err && err.code ? `${err.code} ${err.message}` : err);
     if (err && err.code === 'NO_ID_TOKEN') return res.status(400).json({ error: err.message });
+    // If token verification failed the error message will be informative
     return res.status(401).json({ error: err.message || 'auth failed' });
   }
 });
@@ -291,7 +332,8 @@ app.post('/call/accept', async (req, res) => {
 app.post('/call/reject', async (req, res) => {
   try {
     const decoded = await verifyIdTokenFromHeader(req);
-    const doctorUid = decoded.uid;
+    const tokenUid = decoded.uid;
+    const clientDoctorUid = (req.body && req.body.doctorUid) ? req.body.doctorUid : null;
     const { roomId } = req.body;
     if (!roomId) return res.status(400).json({ error: 'roomId required' });
 
@@ -299,11 +341,29 @@ app.post('/call/reject', async (req, res) => {
     const snap = await callRef.once('value');
     const call = snap.val();
     if (!call) return res.status(404).json({ error: 'call not found' });
-    if (call.doctorUid !== doctorUid) return res.status(403).json({ error: 'not the invited doctor' });
+
+    const storedDoctorUid = call.doctorUid || call.doctor || null;
+
+    if (!storedDoctorUid || tokenUid !== storedDoctorUid) {
+      const debugInfo = {
+        error: 'not the invited doctor',
+        reason: 'caller mismatch',
+        tokenUid,
+        clientDoctorUid,
+        storedDoctorUid
+      };
+      console.warn('/call/reject caller mismatch:', debugInfo);
+
+      if (process.env.NODE_ENV === 'production') {
+        return res.status(403).json({ error: 'not the invited doctor' });
+      } else {
+        return res.status(403).json(debugInfo);
+      }
+    }
 
     await callRef.update({ status: 'rejected', doctorResponseAt: admin.database.ServerValue.TIMESTAMP });
 
-    await db.ref(`users/${doctorUid}/incomingCalls/${roomId}`).remove();
+    await db.ref(`users/${tokenUid}/incomingCalls/${roomId}`).remove().catch(() => {});
 
     return res.json({ ok: true });
   } catch (err) {
