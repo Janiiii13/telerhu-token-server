@@ -1,4 +1,4 @@
-// server.js (edited for clearer token verification and helpful debug responses)
+// server.js (edited for clearer token verification, fixes, and helpful debug responses)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -32,14 +32,13 @@ try {
   serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
 } catch (err) {
   handleMissingEnv('Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON. Ensure it is valid JSON string. ' + (err && err.message ? err.message : ''));
-  // if in dev, we continue (serviceAccount may be undefined) — initialization below will catch it
 }
 
 if (!process.env.FIREBASE_DATABASE_URL) {
   handleMissingEnv('FIREBASE_DATABASE_URL missing in env');
 }
 
-// ------------------ NEW: normalize private_key to valid PEM ------------------
+// ------------------ normalize private_key to valid PEM ------------------
 try {
   if (!serviceAccount || typeof serviceAccount.private_key !== 'string') {
     throw new Error('private_key missing or not a string in service account JSON');
@@ -48,7 +47,6 @@ try {
   let pk = serviceAccount.private_key;
 
   // 1) if the string contains double-escaped backslash-n (\\n) turn them into \n first
-  //    this handles cases where dotenv or other tooling double-escaped.
   pk = pk.replace(/\\\\n/g, '\\n');
 
   // 2) convert any escaped \n into real newlines
@@ -80,14 +78,11 @@ try {
     throw new Error('Invalid PEM formatted private key after normalization.');
   }
 } catch (err) {
-  // If serviceAccount is missing or normalization fails, let initializeApp handle it,
-  // but still surface a helpful message (and possibly exit in production via handleMissingEnv)
   handleMissingEnv('Failed to normalize/validate private_key: ' + (err && err.message ? err.message : 'unknown error'));
 }
 // ---------------------------------------------------------------------------
 
 try {
-  // validate serviceAccount one more time before initializeApp
   if (!serviceAccount || !serviceAccount.private_key) {
     throw new Error('Service account invalid or missing private_key');
   }
@@ -98,7 +93,6 @@ try {
   });
   console.log('Firebase Admin initialized.');
 } catch (err) {
-  // fail in production, warn in dev
   handleMissingEnv('Failed to initialize Firebase Admin SDK: ' + (err && err.message ? err.message : err));
 }
 
@@ -117,9 +111,7 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, time: Date.now(), env: process.env.NODE_ENV || 'unknown' });
 });
 
-// ----------------- DEBUG: non-sensitive env presence checker -----------------
-// Place after /health so it's easy to reach during debugging.
-// Returns booleans (presence) only — never prints secret values.
+// debug env presence (non-sensitive)
 app.get('/check-token', (req, res) => {
   const presence = {
     APP_ID: !!process.env.APP_ID,
@@ -130,11 +122,8 @@ app.get('/check-token', (req, res) => {
   };
   res.json({ ok: true, envPresence: presence });
 });
-// ---------------------------------------------------------------------------
 
-// DEV-ONLY guarded route: use a secret header to allow creating a test call.
-// Set DEV_BYPASS_KEY in Render environment to a random secret (e.g. "dev-xyz-123")
-// This route will only run if DEV_BYPASS_KEY exists and the header x-dev-bypass matches it.
+// DEV bypass: guarded by DEV_BYPASS_KEY
 if (process.env.DEV_BYPASS_KEY) {
   app.post('/dev/test-initiate', async (req, res) => {
     try {
@@ -185,17 +174,14 @@ if (process.env.DEV_BYPASS_KEY) {
   console.warn('DEV_BYPASS_KEY not set; guarded dev bypass route disabled.');
 }
 
-// Robust token verifier with clearer error codes and log messages.
-// Returns decoded token on success or throws an Error with .code for callers.
+// verify ID token helper
 async function verifyIdTokenFromHeader(req) {
   const authHeader = req.headers.authorization || '';
-  // Accept "Bearer <token>" (case-insensitive for 'bearer' prefix)
   const parts = authHeader.split(' ');
   let idToken = null;
   if (parts.length === 2 && /^Bearer$/i.test(parts[0])) {
     idToken = parts[1];
   } else if (authHeader && authHeader.length > 0) {
-    // fallback: if header present but not in Bearer form, attempt to use it as token
     idToken = authHeader;
   }
 
@@ -210,9 +196,7 @@ async function verifyIdTokenFromHeader(req) {
     console.log('verifyIdToken OK uid=', decoded.uid);
     return decoded;
   } catch (err) {
-    // log error code and message for debugging (e.g. expired, revoked, admin-restricted)
     console.error('verifyIdToken failed. code=', err.code, 'message=', err.message);
-    // rethrow original error so callers can choose status handling
     throw err;
   }
 }
@@ -229,7 +213,7 @@ app.post('/call/initiate', async (req, res) => {
     const { doctorUid } = req.body;
     if (!doctorUid) return res.status(400).json({ error: 'doctorUid required' });
 
-    // ensure doctorUid exists and has role 'doctor' (if your DB uses different field change accordingly)
+    // ensure doctorUid exists and is a doctor
     const userSnap = await db.ref(`users/${doctorUid}`).once('value');
     const userData = userSnap.val();
     if (!userData || (String(userData.role || '').toLowerCase() !== 'doctor')) {
@@ -264,18 +248,14 @@ app.post('/call/initiate', async (req, res) => {
   } catch (err) {
     console.error('/call/initiate error:', err && err.code ? `${err.code} ${err.message}` : err);
     if (err && err.code === 'NO_ID_TOKEN') return res.status(400).json({ error: err.message });
-    // If verification error from Firebase Auth propagate its message but respond 401
     return res.status(401).json({ error: err.message || 'auth failed' });
   }
 });
 
 app.post('/call/accept', async (req, res) => {
   try {
-    // Verify token and treat decoded.uid as authoritative caller identity
     const decoded = await verifyIdTokenFromHeader(req);
     const tokenUid = decoded.uid;
-
-    // Also accept optional client-sent doctorUid for debugging, but tokenUid is authoritative
     const clientDoctorUid = (req.body && req.body.doctorUid) ? req.body.doctorUid : null;
     const { roomId } = req.body;
     if (!roomId) return res.status(400).json({ error: 'roomId required' });
@@ -287,9 +267,8 @@ app.post('/call/accept', async (req, res) => {
 
     const storedDoctorUid = call.doctorUid || call.doctor || null;
 
-    // Compare tokenUid (authoritative) to stored value
+    // Only the invited doctor (storedDoctorUid) may accept
     if (!storedDoctorUid || tokenUid !== storedDoctorUid) {
-      // In development, include debug fields to help diagnose the mismatch
       const debugInfo = {
         error: 'not the invited doctor',
         reason: 'caller mismatch',
@@ -300,10 +279,8 @@ app.post('/call/accept', async (req, res) => {
       console.warn('/call/accept caller mismatch:', debugInfo);
 
       if (process.env.NODE_ENV === 'production') {
-        // Keep response minimal in production
         return res.status(403).json({ error: 'not the invited doctor' });
       } else {
-        // Dev: return helpful debug response
         return res.status(403).json(debugInfo);
       }
     }
@@ -311,20 +288,19 @@ app.post('/call/accept', async (req, res) => {
     // Update status & create doctor token
     await callRef.update({ status: 'accepted', doctorResponseAt: admin.database.ServerValue.TIMESTAMP });
 
-    // Remove incoming call entry for doctor
-    await db.ref(`users/${doctorUid}/incomingCalls/${roomId}`).remove().catch(() => {});
+    // Remove incoming call entry for doctor (use storedDoctorUid)
+    await db.ref(`users/${storedDoctorUid}/incomingCalls/${roomId}`).remove().catch(() => {});
 
     const doctorToken = buildAgoraToken(call.channel, 0, RtcRole.PUBLISHER);
     await callRef.child('doctorToken').set(doctorToken);
 
-    // ensure status visible
+    // Ensure status visible
     await callRef.child('status').set('accepted');
 
     return res.json({ token: doctorToken, channel: call.channel });
   } catch (err) {
     console.error('/call/accept error:', err && err.code ? `${err.code} ${err.message}` : err);
     if (err && err.code === 'NO_ID_TOKEN') return res.status(400).json({ error: err.message });
-    // If token verification failed the error message will be informative
     return res.status(401).json({ error: err.message || 'auth failed' });
   }
 });
@@ -363,7 +339,7 @@ app.post('/call/reject', async (req, res) => {
 
     await callRef.update({ status: 'rejected', doctorResponseAt: admin.database.ServerValue.TIMESTAMP });
 
-    await db.ref(`users/${tokenUid}/incomingCalls/${roomId}`).remove().catch(() => {});
+    await db.ref(`users/${storedDoctorUid}/incomingCalls/${roomId}`).remove().catch(() => {});
 
     return res.json({ ok: true });
   } catch (err) {
